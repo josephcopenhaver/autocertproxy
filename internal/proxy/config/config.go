@@ -25,6 +25,7 @@ type Config struct {
 	DstPort               int           `json:"DST_PORT" envconfig:"DST_PORT" default:"8080"`
 	AdminEmail            string        `json:"ADMIN_EMAIL" envconfig:"ADMIN_EMAIL" default:""`
 	AutocertCacheDir      string        `json:"AUTOCERT_CACHE_DIR" envconfig:"AUTOCERT_CACHE_DIR" default:"./.autocert"`
+	Authorization         string        `json:"AUTHORIZATION" default:""`
 }
 
 func Load(cfgPtr interface{}) error {

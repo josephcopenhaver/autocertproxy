@@ -180,7 +180,26 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 
 		srvContexts = append(srvContexts, srvContext)
 
-		handler := httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
+		var handler http.Handler = httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
+
+		if p.cfg.Authorization != "" {
+			proxyHandler := handler
+
+			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+				// validate authorization
+				{
+					user, pass, ok := r.BasicAuth()
+
+					if !ok || user+":"+pass != p.cfg.Authorization {
+						http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+						return
+					}
+				}
+
+				proxyHandler.ServeHTTP(w, r)
+			})
+		}
 
 		srv := http.Server{
 			Addr:      net.JoinHostPort(cfg.ListenHttpsHost, strconv.Itoa(cfg.ListenHttpsPort)),
