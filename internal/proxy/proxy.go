@@ -148,7 +148,9 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 
 		wg.Add(1)
 		go func() {
+			defer wg.Done()
 
+			wg.Add(1)
 			go func() {
 				defer wg.Done()
 
@@ -209,7 +211,9 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 
 		wg.Add(1)
 		go func() {
+			defer wg.Done()
 
+			wg.Add(1)
 			go func() {
 				defer wg.Done()
 
