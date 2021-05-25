@@ -184,8 +184,51 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 
 		var handler http.Handler = httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
 
+		// determine the request's host header value
+		var dstHostHeader string
+		if cfg.DstHostHeader != "" {
+			dstHostHeader = cfg.DstHostHeader
+		} else {
+			dstHostHeader = cfg.DstHost
+		}
+
+		// set the dest host header value as specified
+		{
+			prevHandler := handler
+
+			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+				// ensure host header is scrubbed
+				if r.Header != nil && len(r.Header.Get("Host")) > 0 {
+					prevHeader := r.Header
+
+					defer func() {
+						r.Header = prevHeader
+					}()
+
+					h := prevHeader.Clone()
+					h.Del("Host")
+
+					r.Header = h
+				}
+
+				// ensure the request host name is temporarily altered
+				if r.Host != dstHostHeader {
+					prevHost := r.Host
+
+					defer func() {
+						r.Host = prevHost
+					}()
+
+					r.Host = dstHostHeader
+				}
+
+				prevHandler.ServeHTTP(w, r)
+			})
+		}
+
 		if p.cfg.Authorization != "" {
-			proxyHandler := handler
+			prevHandler := handler
 
 			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -199,7 +242,7 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 					}
 				}
 
-				proxyHandler.ServeHTTP(w, r)
+				prevHandler.ServeHTTP(w, r)
 			})
 		}
 
