@@ -22,6 +22,7 @@ type Config struct {
 	DstScheme             string        `json:"DST_SCHEME" envconfig:"DST_SCHEME" default:"http"`
 	DstBasePath           string        `json:"DST_BASE_PATH" envconfig:"DST_BASE_PATH" default:""`
 	DstHost               string        `json:"DST_HOST" envconfig:"DST_HOST" default:"127.0.0.1"`
+	DstHostHeader         string        `json:"DST_HOST_HEADER" envconfig:"DST_HOST_HEADER" default:""`
 	DstPort               int           `json:"DST_PORT" envconfig:"DST_PORT" default:"8080"`
 	AdminEmail            string        `json:"ADMIN_EMAIL" envconfig:"ADMIN_EMAIL" default:""`
 	AutocertCacheDir      string        `json:"AUTOCERT_CACHE_DIR" envconfig:"AUTOCERT_CACHE_DIR" default:"./.autocert"`
