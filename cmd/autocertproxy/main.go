@@ -68,7 +68,7 @@ func main() {
 		)
 	}
 
-	ctx := proxy.RootContext()
+	ctx, _ := proxy.RootContext()
 
 	if err := p.ListenAndServe(ctx); err != nil {
 		os.Exit(1)

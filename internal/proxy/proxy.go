@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -227,7 +229,40 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			})
 		}
 
-		if p.cfg.Authorization != "" {
+		if cfg.ResponseBufferEnabled {
+			prevHandler := handler
+
+			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+				// read response body till end
+				var resp *http.Response
+				{
+					rec := httptest.NewRecorder()
+
+					prevHandler.ServeHTTP(rec, r)
+
+					resp = rec.Result()
+				}
+
+				// send response headers
+				{
+					h := w.Header()
+					for k, values := range resp.Header {
+						for _, v := range values {
+							h.Add(k, v)
+						}
+					}
+				}
+
+				w.WriteHeader(resp.StatusCode)
+
+				// send response body
+				_, err := io.Copy(w, resp.Body)
+				_ = err // intentionally ignoring error, upstream or downstream must have had an issue
+			})
+		}
+
+		if cfg.Authorization != "" {
 			prevHandler := handler
 
 			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -236,7 +271,7 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 				{
 					user, pass, ok := r.BasicAuth()
 
-					if !ok || user+":"+pass != p.cfg.Authorization {
+					if !ok || user+":"+pass != cfg.Authorization {
 						http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 						return
 					}

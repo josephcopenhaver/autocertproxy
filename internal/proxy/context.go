@@ -9,18 +9,26 @@ import (
 
 // RootContext returns a context that is canceled when the
 // system process receives an interrupt, sigint, or sigterm
-func RootContext() context.Context {
+//
+// Also returns a function that can be used to cancel the context.
+func RootContext() (context.Context, func()) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	done := make(chan os.Signal, 1)
+	procDone := make(chan os.Signal, 1)
 
-	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(procDone, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-done
-		cancel()
+		defer cancel()
+
+		done := ctx.Done()
+
+		select {
+		case <-procDone:
+		case <-done:
+		}
 	}()
 
-	return ctx
+	return ctx, cancel
 }
