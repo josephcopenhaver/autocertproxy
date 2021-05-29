@@ -53,6 +53,15 @@ func New(cfg config.Config, logger *zap.SugaredLogger) (proxy, error) {
 		)
 		return proxy{}, err
 	}
+	dstProxyUrl.Scheme = strings.ToLower(dstProxyUrl.Scheme)
+	if s := dstProxyUrl.Scheme; s != "http" && s != "https" {
+		logger.Errorw(
+			"failed to parse destination url: scheme must be either http or https",
+			"url", dstUrlStr,
+			"error", err,
+		)
+		return proxy{}, err
+	}
 
 	if err := os.MkdirAll(cfg.AutocertCacheDir, 0700); err != nil {
 		logger.Errorw(
@@ -152,20 +161,21 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				<-ctx.Done()
-
-				shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-				defer cancel()
-
-				if err := srv.Shutdown(shutdownContext); err != nil {
-					errChan <- err
-				}
-			}()
 			errChan <- srv.ListenAndServe()
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			<-ctx.Done()
+
+			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+
+			if err := srv.Shutdown(shutdownContext); err != nil {
+				errChan <- err
+			}
 		}()
 	}
 
@@ -291,20 +301,21 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				<-ctx.Done()
-
-				shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-				defer cancel()
-
-				if err := srv.Shutdown(shutdownContext); err != nil {
-					errChan <- err
-				}
-			}()
 			errChan <- srv.ListenAndServeTLS("", "")
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			<-ctx.Done()
+
+			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+
+			if err := srv.Shutdown(shutdownContext); err != nil {
+				errChan <- err
+			}
 		}()
 	}
 
