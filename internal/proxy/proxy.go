@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -21,22 +22,49 @@ import (
 
 type proxy struct {
 	cfg         config.Config
+	dstUdsFile  string
 	dstProxyUrl *url.URL
 	Logger      *zap.SugaredLogger
 }
 
 func New(cfg config.Config, logger *zap.SugaredLogger) (proxy, error) {
 
-	dstUrlStr := cfg.DstScheme + "://" + cfg.DstHost
-	if cfg.DstScheme == "http" {
+	var dstUrlStr string
+	var dstUdsFile string
+
+	switch cfg.DstScheme {
+	case "http":
+
+		dstUrlStr = cfg.DstScheme + "://" + cfg.DstHost
 		if cfg.DstPort != 80 {
 			dstUrlStr += ":" + strconv.Itoa(cfg.DstPort)
 		}
-	} else if cfg.DstScheme == "https" {
+	case "https":
+
+		dstUrlStr = cfg.DstScheme + "://" + cfg.DstHost
 		if cfg.DstPort != 443 {
 			dstUrlStr += ":" + strconv.Itoa(cfg.DstPort)
 		}
+	case "unix", "http+unix", "https+unix":
+
+		scheme := "http"
+		if strings.HasPrefix(cfg.DstScheme, "https+") {
+			scheme = "https"
+		}
+
+		host := "127.0.0.1"
+		if cfg.DstHostHeader != "" {
+			host = cfg.DstHostHeader
+		}
+
+		dstUrlStr = scheme + "://" + host
+
+		dstUdsFile = cfg.DstHost
+		if dstUdsFile == "" {
+			return proxy{}, fmt.Errorf("must specify a file as DST_HOST when using %s scheme", cfg.DstScheme)
+		}
 	}
+
 	if cfg.DstBasePath != "" {
 		if cfg.DstBasePath[0] != '/' {
 			dstUrlStr += "/"
@@ -74,6 +102,7 @@ func New(cfg config.Config, logger *zap.SugaredLogger) (proxy, error) {
 
 	return proxy{
 		cfg:         cfg,
+		dstUdsFile:  dstUdsFile,
 		dstProxyUrl: dstProxyUrl,
 		Logger:      logger,
 	}, nil
@@ -84,11 +113,21 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 	logger := p.Logger
 	cfg := p.cfg
 
-	logger.Infow(
-		"server starting",
-		"config", cfg,
-		"dst_url", p.dstProxyUrl.String(),
-	)
+	{
+		logFields := []interface{}{
+			"config", cfg,
+			"dst_url", p.dstProxyUrl.String(),
+		}
+		if p.dstUdsFile != "" {
+			logFields = append(logFields,
+				"dst_unix_domain_socket_file", p.dstUdsFile,
+			)
+		}
+		logger.Infow(
+			"server starting",
+			logFields...,
+		)
+	}
 
 	am := autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
@@ -194,7 +233,28 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 
 		srvContexts = append(srvContexts, srvContext)
 
-		var handler http.Handler = httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
+		var handler http.Handler
+
+		if p.dstUdsFile != "" {
+
+			tran, ok := http.DefaultTransport.(*http.Transport)
+			if !ok {
+				panic("failed to cast http.DefaultTransport to *http.Transport when making a unix socket dialer")
+			}
+			tran = tran.Clone()
+			var dialer net.Dialer
+			tran.DialContext = func(ctx context.Context, _ string, _ string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "unix", p.dstUdsFile)
+			}
+
+			proxy := httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
+			proxy.Transport = tran
+
+			handler = proxy
+		} else {
+
+			handler = httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
+		}
 
 		// determine the request's host header value
 		var dstHostHeader string
