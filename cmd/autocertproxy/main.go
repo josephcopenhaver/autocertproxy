@@ -68,10 +68,15 @@ func main() {
 		)
 	}
 
-	ctx, _ := proxy.RootContext()
+	ctx, cancel := proxy.RootContext()
+	defer cancel()
 
 	if err := p.ListenAndServe(ctx); err != nil {
-		os.Exit(1)
+		logger.Errorw(
+			"server shutdown unexpectedly",
+			"error", err,
+		)
+		return
 	}
 
 	logger.Warnw("server shutdown successful")

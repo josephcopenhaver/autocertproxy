@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/josephcopenhaver/autocertproxy/internal/logging"
 )
 
 // RootContext returns a context that is canceled when the
@@ -24,10 +26,18 @@ func RootContext() (context.Context, func()) {
 
 		done := ctx.Done()
 
+		requester := "unknown"
 		select {
 		case <-procDone:
+			requester = "user"
 		case <-done:
+			requester = "process"
 		}
+
+		logging.Logger.Warnw(
+			"shutdown requested",
+			"requester", requester,
+		)
 	}()
 
 	return ctx, cancel

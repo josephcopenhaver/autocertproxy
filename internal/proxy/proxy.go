@@ -12,12 +12,12 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 
 	"go.uber.org/zap"
 
 	"github.com/josephcopenhaver/autocertproxy/internal/proxy/config"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/sync/errgroup"
 )
 
 type proxy struct {
@@ -112,6 +112,7 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 
 	logger := p.Logger
 	cfg := p.cfg
+	pctx := ctx
 
 	{
 		logFields := []interface{}{
@@ -124,9 +125,53 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			)
 		}
 		logger.Infow(
-			"server starting",
+			"servers starting",
 			logFields...,
 		)
+	}
+
+	errgrp, ctx := errgroup.WithContext(ctx)
+
+	logSrvStart := func(name, addr string) {
+		logger.Warnw(
+			"server listener starting",
+			"name", name,
+			"addr", addr,
+		)
+	}
+
+	handleSrvErr := func(name string, err error) error {
+
+		if err == nil || err == http.ErrServerClosed {
+			return nil
+		}
+
+		if pctx.Err() == nil {
+			logger.Errorw(
+				"server listener exited unexpectedly",
+				"name", name,
+				"error", err,
+			)
+		}
+
+		return err
+	}
+
+	registerShutdown := func(srv *http.Server) {
+		errgrp.Go(func() error {
+
+			<-ctx.Done()
+
+			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+
+			err := srv.Shutdown(shutdownContext)
+			if err == http.ErrServerClosed {
+				err = nil
+			}
+
+			return err
+		})
 	}
 
 	am := autocert.Manager{
@@ -136,29 +181,13 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 		Email:      cfg.AdminEmail,
 	}
 
-	var wg sync.WaitGroup
-
-	type ServerContext struct {
-		Name    string
-		ErrChan chan error
-	}
-
-	var srvContexts []ServerContext
-
 	//
 	// start http to https redirect policy handler on port cfg.ListenHttpPort
 	//
 
 	if cfg.ForceHttps {
 
-		errChan := make(chan error, 2)
-
-		srvContext := ServerContext{
-			Name:    "http",
-			ErrChan: errChan,
-		}
-
-		srvContexts = append(srvContexts, srvContext)
+		serverName := "http"
 
 		redirectHosts := make(map[string]string, len(cfg.SslHostnames)+1)
 		for _, v := range cfg.SslHostnames {
@@ -166,7 +195,7 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 		}
 		redirectHosts[""] = cfg.SslHostnames[0]
 
-		handler := func(w http.ResponseWriter, req *http.Request) {
+		var handler http.HandlerFunc = func(w http.ResponseWriter, req *http.Request) {
 
 			newUrl := *req.URL
 			host := req.Host
@@ -193,29 +222,16 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 
 		srv := http.Server{
 			Addr:    net.JoinHostPort(cfg.ListenHttpHost, strconv.Itoa(cfg.ListenHttpPort)),
-			Handler: http.HandlerFunc(handler),
+			Handler: handler,
 		}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		logSrvStart(serverName, srv.Addr)
 
-			errChan <- srv.ListenAndServe()
-		}()
+		errgrp.Go(func() error {
+			return handleSrvErr(serverName, srv.ListenAndServe())
+		})
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			<-ctx.Done()
-
-			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-			defer cancel()
-
-			if err := srv.Shutdown(shutdownContext); err != nil {
-				errChan <- err
-			}
-		}()
+		registerShutdown(&srv)
 	}
 
 	//
@@ -224,16 +240,9 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 
 	{
 
-		errChan := make(chan error, 2)
+		serverName := "https"
 
-		srvContext := ServerContext{
-			Name:    "https",
-			ErrChan: errChan,
-		}
-
-		srvContexts = append(srvContexts, srvContext)
-
-		var handler http.Handler
+		var handler http.HandlerFunc
 
 		if p.dstUdsFile != "" {
 
@@ -250,10 +259,10 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			proxy := httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
 			proxy.Transport = tran
 
-			handler = proxy
+			handler = proxy.ServeHTTP
 		} else {
 
-			handler = httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
+			handler = httputil.NewSingleHostReverseProxy(p.dstProxyUrl).ServeHTTP
 		}
 
 		// determine the request's host header value
@@ -266,9 +275,9 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 
 		// set the dest host header value as specified
 		{
-			prevHandler := handler
+			next := handler
 
-			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handler = func(w http.ResponseWriter, r *http.Request) {
 
 				// ensure host header is scrubbed
 				if r.Header != nil && len(r.Header.Get("Host")) > 0 {
@@ -295,21 +304,21 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 					r.Host = dstHostHeader
 				}
 
-				prevHandler.ServeHTTP(w, r)
-			})
+				next(w, r)
+			}
 		}
 
 		if cfg.ResponseBufferEnabled {
-			prevHandler := handler
+			next := handler
 
-			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handler = func(w http.ResponseWriter, r *http.Request) {
 
 				// read response body till end
 				var resp *http.Response
 				{
 					rec := httptest.NewRecorder()
 
-					prevHandler.ServeHTTP(rec, r)
+					next(rec, r)
 
 					resp = rec.Result()
 				}
@@ -329,13 +338,13 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 				// send response body
 				_, err := io.Copy(w, resp.Body)
 				_ = err // intentionally ignoring error, upstream or downstream must have had an issue
-			})
+			}
 		}
 
 		if cfg.Authorization != "" {
-			prevHandler := handler
+			next := handler
 
-			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handler = func(w http.ResponseWriter, r *http.Request) {
 
 				// validate authorization
 				{
@@ -347,8 +356,8 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 					}
 				}
 
-				prevHandler.ServeHTTP(w, r)
-			})
+				next(w, r)
+			}
 		}
 
 		srv := http.Server{
@@ -357,53 +366,18 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			Handler:   handler,
 		}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		logSrvStart(serverName, srv.Addr)
 
-			errChan <- srv.ListenAndServeTLS("", "")
-		}()
+		errgrp.Go(func() error {
+			return handleSrvErr(serverName, srv.ListenAndServeTLS("", ""))
+		})
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			<-ctx.Done()
-
-			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-			defer cancel()
-
-			if err := srv.Shutdown(shutdownContext); err != nil {
-				errChan <- err
-			}
-		}()
+		registerShutdown(&srv)
 	}
 
-	//
-	// wait for server shutdowns
-	//
+	logger.Warnw(
+		"waiting for shutdown signal",
+	)
 
-	wg.Wait()
-
-	//
-	// handle any shutdown errors
-	//
-
-	var shutdownErr error
-
-	for _, srvContext := range srvContexts {
-
-		if err := <-srvContext.ErrChan; err != nil && err != http.ErrServerClosed {
-
-			shutdownErr = err
-
-			logger.Errorw(
-				"server shutdown error",
-				"name", srvContext.Name,
-				"error", err,
-			)
-		}
-	}
-
-	return shutdownErr
+	return errgrp.Wait()
 }
