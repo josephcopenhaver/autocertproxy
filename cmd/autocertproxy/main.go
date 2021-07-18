@@ -73,7 +73,7 @@ func main() {
 
 	if err := p.ListenAndServe(ctx); err != nil {
 		logger.Errorw(
-			"server shutdown unexpectedly",
+			"server shutdown incorrectly",
 			"error", err,
 		)
 		return

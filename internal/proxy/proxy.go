@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,12 +13,18 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/josephcopenhaver/autocertproxy/internal/proxy/config"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/sync/errgroup"
+)
+
+var (
+	ErrServerContextPanicked  = errors.New("server context panicked")
+	ErrServerShutdownPanicked = errors.New("server shutdown panicked")
 )
 
 type proxy struct {
@@ -125,7 +132,7 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			)
 		}
 		logger.Infow(
-			"servers starting",
+			"server listners starting",
 			logFields...,
 		)
 	}
@@ -140,38 +147,49 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 		)
 	}
 
-	handleSrvErr := func(name string, err error) error {
+	logSrvErr := func(name string, errChan chan error, run func() error) {
 
+		err := ErrServerContextPanicked
+		defer func() {
+			if err == nil || err == http.ErrServerClosed {
+				return
+			}
+
+			errChan <- err
+		}()
+
+		err = run()
 		if err == nil || err == http.ErrServerClosed {
-			return nil
+			return
 		}
 
 		if pctx.Err() == nil {
 			logger.Errorw(
-				"server listener exited unexpectedly",
+				"server listener exited incorrectly",
 				"name", name,
 				"error", err,
 			)
 		}
-
-		return err
 	}
 
-	registerShutdown := func(srv *http.Server) {
-		errgrp.Go(func() error {
+	registerShutdown := func(srv *http.Server, errChan chan error) {
+		go func() {
+
+			err := ErrServerShutdownPanicked
+			defer func() {
+				errChan <- err
+			}()
 
 			<-ctx.Done()
 
 			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 			defer cancel()
 
-			err := srv.Shutdown(shutdownContext)
+			err = srv.Shutdown(shutdownContext)
 			if err == http.ErrServerClosed {
 				err = nil
 			}
-
-			return err
-		})
+		}()
 	}
 
 	am := autocert.Manager{
@@ -225,13 +243,17 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			Handler: handler,
 		}
 
+		errChan := make(chan error, 2)
+
 		logSrvStart(serverName, srv.Addr)
 
-		errgrp.Go(func() error {
-			return handleSrvErr(serverName, srv.ListenAndServe())
-		})
+		go logSrvErr(serverName, errChan, srv.ListenAndServe)
 
-		registerShutdown(&srv)
+		registerShutdown(&srv, errChan)
+
+		errgrp.Go(func() error {
+			return <-errChan
+		})
 	}
 
 	//
@@ -251,7 +273,10 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 				panic("failed to cast http.DefaultTransport to *http.Transport when making a unix socket dialer")
 			}
 			tran = tran.Clone()
-			var dialer net.Dialer
+			dialer := net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}
 			tran.DialContext = func(ctx context.Context, _ string, _ string) (net.Conn, error) {
 				return dialer.DialContext(ctx, "unix", p.dstUdsFile)
 			}
@@ -366,13 +391,19 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			Handler:   handler,
 		}
 
+		errChan := make(chan error, 2)
+
 		logSrvStart(serverName, srv.Addr)
 
-		errgrp.Go(func() error {
-			return handleSrvErr(serverName, srv.ListenAndServeTLS("", ""))
+		go logSrvErr(serverName, errChan, func() error {
+			return srv.ListenAndServeTLS("", "")
 		})
 
-		registerShutdown(&srv)
+		registerShutdown(&srv, errChan)
+
+		errgrp.Go(func() error {
+			return <-errChan
+		})
 	}
 
 	logger.Warnw(
