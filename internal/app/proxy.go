@@ -1,8 +1,10 @@
-package proxy
+package app
 
 import (
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,20 +14,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
-	"go.uber.org/zap"
-
-	"github.com/josephcopenhaver/autocertproxy/internal/proxy/config"
+	"github.com/josephcopenhaver/autocertproxy/internal/app/config"
 	"golang.org/x/crypto/acme/autocert"
 )
 
 type proxy struct {
 	cfg         config.Config
 	dstProxyUrl *url.URL
-	Logger      *zap.SugaredLogger
 }
 
-func New(cfg config.Config, logger *zap.SugaredLogger) (proxy, error) {
+func newProxy(ctx context.Context, cfg config.Config, logger *slog.Logger) (proxy, error) {
 
 	dstUrlStr := cfg.DstScheme + "://" + cfg.DstHost
 	if cfg.DstScheme == "http" {
@@ -46,28 +46,28 @@ func New(cfg config.Config, logger *zap.SugaredLogger) (proxy, error) {
 
 	dstProxyUrl, err := url.Parse(dstUrlStr)
 	if err != nil {
-		logger.Errorw(
+		logger.LogAttrs(ctx, slog.LevelError,
 			"failed to parse destination url",
-			"url", dstUrlStr,
-			"error", err,
+			slog.String("url", dstUrlStr),
+			errAttr(err),
 		)
 		return proxy{}, err
 	}
 	dstProxyUrl.Scheme = strings.ToLower(dstProxyUrl.Scheme)
 	if s := dstProxyUrl.Scheme; s != "http" && s != "https" {
-		logger.Errorw(
+		logger.LogAttrs(ctx, slog.LevelError,
 			"failed to parse destination url: scheme must be either http or https",
-			"url", dstUrlStr,
-			"error", err,
+			slog.String("url", dstUrlStr),
+			errAttr(err),
 		)
 		return proxy{}, err
 	}
 
 	if err := os.MkdirAll(cfg.AutocertCacheDir, 0700); err != nil {
-		logger.Errorw(
+		logger.LogAttrs(ctx, slog.LevelError,
 			"failed to make autocert cache directory",
-			"error", err,
-			"directory", cfg.AutocertCacheDir,
+			slog.String("directory", cfg.AutocertCacheDir),
+			errAttr(err),
 		)
 		return proxy{}, err
 	}
@@ -75,19 +75,19 @@ func New(cfg config.Config, logger *zap.SugaredLogger) (proxy, error) {
 	return proxy{
 		cfg:         cfg,
 		dstProxyUrl: dstProxyUrl,
-		Logger:      logger,
 	}, nil
 }
 
-func (p *proxy) ListenAndServe(ctx context.Context) error {
+func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	logger := p.Logger
 	cfg := p.cfg
 
-	logger.Infow(
+	logger.LogAttrs(ctx, slog.LevelInfo,
 		"server starting",
-		"config", cfg,
-		"dst_url", p.dstProxyUrl.String(),
+		slog.Any("config", cfg),
+		slog.String("dst_url", p.dstProxyUrl.String()),
 	)
 
 	am := autocert.Manager{
@@ -98,6 +98,14 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 	}
 
 	var wg sync.WaitGroup
+	defer wg.Wait()
+	defer cancel()
+
+	newWGDoneOnce := func() func() {
+		return sync.OnceFunc(func() {
+			wg.Done()
+		})
+	}
 
 	type ServerContext struct {
 		Name    string
@@ -157,11 +165,25 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			Handler: http.HandlerFunc(handler),
 		}
 
+		var shuttingDown int32
 		wg.Add(1)
+		srvDone := newWGDoneOnce()
 		go func() {
-			defer wg.Done()
+			defer srvDone()
+			defer cancel()
 
-			errChan <- srv.ListenAndServe()
+			err := srv.ListenAndServe()
+			if atomic.LoadInt32(&shuttingDown) == 0 {
+				logger.LogAttrs(ctx, slog.LevelError,
+					"server exited unexpectedly",
+					slog.String("server", srvContext.Name),
+					errAttr(err),
+				)
+			} else if errors.Is(err, http.ErrServerClosed) {
+				return
+			}
+
+			errChan <- err
 		}()
 
 		wg.Add(1)
@@ -173,8 +195,17 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 			defer cancel()
 
+			atomic.StoreInt32(&shuttingDown, 1)
 			if err := srv.Shutdown(shutdownContext); err != nil {
 				errChan <- err
+
+				// server failed to shutdown gracefully
+				// so mark it as done even though it failed
+				// to become done which ensures this function returns
+				//
+				// it will likely leak a goroutine when this happens
+				// assuming the server is still listening properly
+				srvDone()
 			}
 		}()
 	}
@@ -297,11 +328,25 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			Handler:   handler,
 		}
 
+		var shuttingDown int32
 		wg.Add(1)
+		srvDone := newWGDoneOnce()
 		go func() {
-			defer wg.Done()
+			defer srvDone()
+			defer cancel()
 
-			errChan <- srv.ListenAndServeTLS("", "")
+			err := srv.ListenAndServeTLS("", "")
+			if atomic.LoadInt32(&shuttingDown) == 0 {
+				logger.LogAttrs(ctx, slog.LevelError,
+					"server exited unexpectedly",
+					slog.String("server", srvContext.Name),
+					errAttr(err),
+				)
+			} else if errors.Is(err, http.ErrServerClosed) {
+				return
+			}
+
+			errChan <- err
 		}()
 
 		wg.Add(1)
@@ -313,14 +358,23 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 			defer cancel()
 
+			atomic.StoreInt32(&shuttingDown, 1)
 			if err := srv.Shutdown(shutdownContext); err != nil {
 				errChan <- err
+
+				// server failed to shutdown gracefully
+				// so mark it as done even though it failed
+				// to become done which ensures this function returns
+				//
+				// it will likely leak a goroutine when this happens
+				// assuming the server is still listening properly
+				srvDone()
 			}
 		}()
 	}
 
 	//
-	// wait for server shutdowns
+	// wait for goroutines to finish
 	//
 
 	wg.Wait()
@@ -329,21 +383,25 @@ func (p *proxy) ListenAndServe(ctx context.Context) error {
 	// handle any shutdown errors
 	//
 
-	var shutdownErr error
-
+	var shutdownErrors []error
 	for _, srvContext := range srvContexts {
-
-		if err := <-srvContext.ErrChan; err != nil && err != http.ErrServerClosed {
-
-			shutdownErr = err
-
-			logger.Errorw(
-				"server shutdown error",
-				"name", srvContext.Name,
-				"error", err,
-			)
+		var stop bool
+		for !stop {
+			select {
+			case err := <-srvContext.ErrChan:
+				shutdownErrors = append(shutdownErrors, err)
+			default:
+				stop = true
+			}
 		}
 	}
 
-	return shutdownErr
+	switch len(shutdownErrors) {
+	case 0:
+		return nil
+	case 1:
+		return shutdownErrors[0]
+	default:
+		return errors.Join(shutdownErrors...)
+	}
 }

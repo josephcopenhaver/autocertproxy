@@ -4,13 +4,12 @@ import (
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
-	"go.uber.org/zap/zapcore"
 )
 
 // TODO: allow for configuration of upstream Host header in proxied requests
 
 type Config struct {
-	LogLevel              zapcore.Level `json:"LOG_LEVEL" envconfig:"LOG_LEVEL" default:"info"`
+	LogLevel              string        `json:"LOG_LEVEL" envconfig:"LOG_LEVEL"`
 	ForceHttps            bool          `json:"FORCE_HTTPS" envconfig:"FORCE_HTTPS" default:"true"`
 	ShutdownTimeout       time.Duration `json:"SHUTDOWN_TIMEOUT" envconfig:"SHUTDOWN_TIMEOUT" default:"29s"`
 	SslHostnames          []string      `json:"SSL_HOSTNAMES" envconfig:"SSL_HOSTNAMES" default:""`
