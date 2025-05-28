@@ -96,7 +96,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 
 	type serverContext struct {
 		name    string
-		errChan chan error
+		errChan <-chan error
 	}
 	var srvContexts []serverContext
 
@@ -106,13 +106,11 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 
 	if cfg.ForceHttps {
 
-		errChan := make(chan error, 1)
-
 		srvCtx := serverContext{
-			name:    "http",
-			errChan: errChan,
+			name: "http",
 		}
 
+		srvCtxIdx := len(srvContexts)
 		srvContexts = append(srvContexts, srvCtx)
 
 		redirectHosts := make(map[string]string, len(cfg.SslHostnames)+1)
@@ -151,10 +149,9 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 			Handler: http.HandlerFunc(handler),
 		}
 
-		go listenAndServe(ctx, logger, listenAndServeConfig{
+		srvContexts[srvCtxIdx].errChan = listenAndServe(ctx, logger, listenAndServeConfig{
 			name:            srvCtx.name,
 			srv:             &srv,
-			errChan:         srvCtx.errChan,
 			shutdownTimeout: cfg.ShutdownTimeout,
 		})
 	}
@@ -165,13 +162,11 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 
 	{
 
-		errChan := make(chan error, 1)
-
 		srvCtx := serverContext{
-			name:    "https",
-			errChan: errChan,
+			name: "https",
 		}
 
+		srvCtxIdx := len(srvContexts)
 		srvContexts = append(srvContexts, srvCtx)
 
 		var handler http.Handler = httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
@@ -277,10 +272,9 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 			Handler:   handler,
 		}
 
-		go listenAndServe(ctx, logger, listenAndServeConfig{
+		srvContexts[srvCtxIdx].errChan = listenAndServe(ctx, logger, listenAndServeConfig{
 			name:            srvCtx.name,
 			srv:             &srv,
-			errChan:         srvCtx.errChan,
 			shutdownTimeout: cfg.ShutdownTimeout,
 			tlsEnabled:      true,
 		})
@@ -308,32 +302,32 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 	}
 }
 
+type httpServerCloser interface {
+	Shutdown(ctx context.Context) error
+	Close() error
+}
+
+type httpServer interface {
+	httpServerCloser
+	ListenAndServe() error
+	ListenAndServeTLS(certFile, keyFile string) error
+}
+
 type listenAndServeConfig struct {
 	name, tlsCertFile, tlsKeyFile string
-	errChan                       chan error
 	shutdownTimeout               time.Duration
-	srv                           *http.Server
+	srv                           httpServer
 	tlsEnabled                    bool
 }
 
 var (
 	errServerGracefulShutdown = errors.New("server graceful shutdown failed")
 	errServerClose            = errors.New("server close failed")
+	errServerNotStarted       = errors.New("server not started")
 )
 
-func listenAndServe(ctx context.Context, logger *slog.Logger, cfg listenAndServeConfig) {
-	defer close(cfg.errChan)
-
-	serveRespChan := make(chan error, 1)
-
-	if err := ctx.Err(); err != nil {
-		logger.LogAttrs(ctx, slog.LevelError,
-			"server ListenAndServe not attempted",
-			errAttr(err),
-		)
-		cfg.errChan <- err
-		return
-	}
+func listenAndServe(ctx context.Context, logger *slog.Logger, cfg listenAndServeConfig) <-chan error {
+	errChan := make(chan error, 1)
 
 	var listenAndServe func() error
 	if !cfg.tlsEnabled {
@@ -342,6 +336,25 @@ func listenAndServe(ctx context.Context, logger *slog.Logger, cfg listenAndServe
 		listenAndServe = func() error {
 			return cfg.srv.ListenAndServeTLS(cfg.tlsCertFile, cfg.tlsKeyFile)
 		}
+	}
+
+	go asyncListenAndServe(ctx, logger, errChan, cfg.name, listenAndServe, cfg.shutdownTimeout, cfg.srv)
+
+	return errChan
+}
+
+func asyncListenAndServe(ctx context.Context, logger *slog.Logger, errChan chan error, name string, listenAndServe func() error, shutdownTimeout time.Duration, hsc httpServerCloser) {
+	defer close(errChan)
+
+	serveRespChan := make(chan error, 1)
+
+	if err := ctx.Err(); err != nil {
+		logger.LogAttrs(ctx, slog.LevelError,
+			"server ListenAndServe not attempted",
+			errAttr(err),
+		)
+		errChan <- errors.Join(errServerNotStarted, err)
+		return
 	}
 
 	go func() {
@@ -355,10 +368,10 @@ func listenAndServe(ctx context.Context, logger *slog.Logger, cfg listenAndServe
 			logger.LogAttrs(ctx, slog.LevelError,
 				"server exited unexpectedly",
 				slog.String("graceful-shutdown", "not attempted"),
-				slog.String("server", cfg.name),
+				slog.String("server", name),
 				errAttr(err),
 			)
-			cfg.errChan <- err
+			errChan <- err
 		}
 		return
 	case <-ctxDone:
@@ -367,33 +380,33 @@ func listenAndServe(ctx context.Context, logger *slog.Logger, cfg listenAndServe
 
 	logger.LogAttrs(ctx, slog.LevelInfo,
 		"gracefully shutting down server",
-		slog.String("server", cfg.name),
+		slog.String("server", name),
 	)
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	if err := cfg.srv.Shutdown(shutdownCtx); err != nil {
+	if err := hsc.Shutdown(shutdownCtx); err != nil {
 		logger.LogAttrs(ctx, slog.LevelError,
 			"server graceful shutdown failed",
-			slog.String("server", cfg.name),
+			slog.String("server", name),
 			slog.String("graceful-shutdown", "attempted"),
 			errAttr(err),
 		)
 
 		// server failed to shutdown gracefully
 		// so force close it
-		if closeErr := cfg.srv.Close(); closeErr != nil {
+		if closeErr := hsc.Close(); closeErr != nil {
 			logger.LogAttrs(ctx, slog.LevelError,
 				"server forced shutdown failed",
-				slog.String("server", cfg.name),
+				slog.String("server", name),
 				errAttr(closeErr),
 			)
-			cfg.errChan <- errors.Join(errServerClose, closeErr, errServerGracefulShutdown, err)
+			errChan <- errors.Join(errServerClose, closeErr, errServerGracefulShutdown, err)
 			return
 		}
 
-		cfg.errChan <- errors.Join(errServerGracefulShutdown, err)
+		errChan <- errors.Join(errServerGracefulShutdown, err)
 		return
 	}
 
@@ -401,15 +414,15 @@ func listenAndServe(ctx context.Context, logger *slog.Logger, cfg listenAndServe
 		logger.LogAttrs(ctx, slog.LevelError,
 			"server exited unexpectedly",
 			slog.String("graceful-shutdown", "attempted"),
-			slog.String("server", cfg.name),
+			slog.String("server", name),
 			errAttr(err),
 		)
-		cfg.errChan <- err
+		errChan <- err
 		return
 	}
 
 	logger.LogAttrs(ctx, slog.LevelInfo,
 		"server stopped",
-		slog.String("server", cfg.name),
+		slog.String("server", name),
 	)
 }
