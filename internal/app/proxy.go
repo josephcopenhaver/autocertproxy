@@ -13,8 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
+	"time"
 
 	"github.com/josephcopenhaver/autocertproxy/internal/app/config"
 	"golang.org/x/crypto/acme/autocert"
@@ -78,10 +77,15 @@ func newProxy(ctx context.Context, cfg config.Config, logger *slog.Logger) (prox
 	}, nil
 }
 
-func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+type tlsHttpServer struct {
+	*http.Server
+}
 
+func (s tlsHttpServer) ListenAndServe() error {
+	return s.Server.ListenAndServeTLS("", "")
+}
+
+func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 	cfg := p.cfg
 
 	logger.LogAttrs(ctx, slog.LevelInfo,
@@ -97,22 +101,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 		Email:      cfg.AdminEmail,
 	}
 
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	defer cancel()
-
-	newWGDoneOnce := func() func() {
-		return sync.OnceFunc(func() {
-			wg.Done()
-		})
-	}
-
-	type ServerContext struct {
-		Name    string
-		ErrChan chan error
-	}
-
-	var srvContexts []ServerContext
+	var srvContexts []serverContext
 
 	//
 	// start http to https redirect policy handler on port cfg.ListenHttpPort
@@ -120,14 +109,14 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 
 	if cfg.ForceHttps {
 
-		errChan := make(chan error, 2)
+		errChan := make(chan error, 1)
 
-		srvContext := ServerContext{
+		srvCtx := serverContext{
 			Name:    "http",
 			ErrChan: errChan,
 		}
 
-		srvContexts = append(srvContexts, srvContext)
+		srvContexts = append(srvContexts, srvCtx)
 
 		redirectHosts := make(map[string]string, len(cfg.SslHostnames)+1)
 		for _, v := range cfg.SslHostnames {
@@ -165,49 +154,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 			Handler: http.HandlerFunc(handler),
 		}
 
-		var shuttingDown int32
-		wg.Add(1)
-		srvDone := newWGDoneOnce()
-		go func() {
-			defer srvDone()
-			defer cancel()
-
-			err := srv.ListenAndServe()
-			if atomic.LoadInt32(&shuttingDown) == 0 {
-				logger.LogAttrs(ctx, slog.LevelError,
-					"server exited unexpectedly",
-					slog.String("server", srvContext.Name),
-					errAttr(err),
-				)
-			} else if errors.Is(err, http.ErrServerClosed) {
-				return
-			}
-
-			errChan <- err
-		}()
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			<-ctx.Done()
-
-			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-			defer cancel()
-
-			atomic.StoreInt32(&shuttingDown, 1)
-			if err := srv.Shutdown(shutdownContext); err != nil {
-				errChan <- err
-
-				// server failed to shutdown gracefully
-				// so mark it as done even though it failed
-				// to become done which ensures this function returns
-				//
-				// it will likely leak a goroutine when this happens
-				// assuming the server is still listening properly
-				srvDone()
-			}
-		}()
+		go listenAndServe(ctx, logger, srvCtx, cfg.ShutdownTimeout, &srv)
 	}
 
 	//
@@ -216,14 +163,14 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 
 	{
 
-		errChan := make(chan error, 2)
+		errChan := make(chan error, 1)
 
-		srvContext := ServerContext{
+		srvCtx := serverContext{
 			Name:    "https",
 			ErrChan: errChan,
 		}
 
-		srvContexts = append(srvContexts, srvContext)
+		srvContexts = append(srvContexts, srvCtx)
 
 		var handler http.Handler = httputil.NewSingleHostReverseProxy(p.dstProxyUrl)
 
@@ -328,71 +275,18 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 			Handler:   handler,
 		}
 
-		var shuttingDown int32
-		wg.Add(1)
-		srvDone := newWGDoneOnce()
-		go func() {
-			defer srvDone()
-			defer cancel()
-
-			err := srv.ListenAndServeTLS("", "")
-			if atomic.LoadInt32(&shuttingDown) == 0 {
-				logger.LogAttrs(ctx, slog.LevelError,
-					"server exited unexpectedly",
-					slog.String("server", srvContext.Name),
-					errAttr(err),
-				)
-			} else if errors.Is(err, http.ErrServerClosed) {
-				return
-			}
-
-			errChan <- err
-		}()
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			<-ctx.Done()
-
-			shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-			defer cancel()
-
-			atomic.StoreInt32(&shuttingDown, 1)
-			if err := srv.Shutdown(shutdownContext); err != nil {
-				errChan <- err
-
-				// server failed to shutdown gracefully
-				// so mark it as done even though it failed
-				// to become done which ensures this function returns
-				//
-				// it will likely leak a goroutine when this happens
-				// assuming the server is still listening properly
-				srvDone()
-			}
-		}()
+		go listenAndServe(ctx, logger, srvCtx, cfg.ShutdownTimeout, tlsHttpServer{&srv})
 	}
 
 	//
 	// wait for goroutines to finish
+	// and handle any shutdown errors
 	//
 
-	wg.Wait()
-
-	//
-	// handle any shutdown errors
-	//
-
-	var shutdownErrors []error
+	shutdownErrors := make([]error, 0, len(srvContexts))
 	for _, srvContext := range srvContexts {
-		var stop bool
-		for !stop {
-			select {
-			case err := <-srvContext.ErrChan:
-				shutdownErrors = append(shutdownErrors, err)
-			default:
-				stop = true
-			}
+		if err, ok := <-srvContext.ErrChan; ok {
+			shutdownErrors = append(shutdownErrors, err)
 		}
 	}
 
@@ -404,4 +298,104 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 	default:
 		return errors.Join(shutdownErrors...)
 	}
+}
+
+type serverContext struct {
+	Name    string
+	ErrChan chan error
+}
+
+type httpServer interface {
+	Shutdown(ctx context.Context) error
+	Close() error
+	ListenAndServe() error
+}
+
+var (
+	errServerGracefulShutdown = errors.New("server graceful shutdown failed")
+	errServerClose            = errors.New("server close failed")
+)
+
+func listenAndServe(ctx context.Context, logger *slog.Logger, srvCtx serverContext, shutdownTimeout time.Duration, srv httpServer) {
+	defer close(srvCtx.ErrChan)
+
+	serveRespChan := make(chan error, 1)
+
+	if err := ctx.Err(); err != nil {
+		logger.LogAttrs(ctx, slog.LevelError,
+			"server ListenAndServe not attempted",
+			errAttr(err),
+		)
+		srvCtx.ErrChan <- err
+		return
+	}
+
+	go func() {
+		serveRespChan <- srv.ListenAndServe()
+	}()
+
+	ctxDone := ctx.Done()
+	select {
+	case err := <-serveRespChan:
+		if err != nil {
+			logger.LogAttrs(ctx, slog.LevelError,
+				"server exited unexpectedly",
+				slog.String("graceful-shutdown", "not attempted"),
+				slog.String("server", srvCtx.Name),
+				errAttr(err),
+			)
+			srvCtx.ErrChan <- err
+		}
+		return
+	case <-ctxDone:
+		// context has been cancelled, so we should try to shutdown the server gracefully
+	}
+
+	logger.LogAttrs(ctx, slog.LevelInfo,
+		"gracefully shutting down server",
+		slog.String("server", srvCtx.Name),
+	)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.LogAttrs(ctx, slog.LevelError,
+			"server graceful shutdown failed",
+			slog.String("server", srvCtx.Name),
+			slog.String("graceful-shutdown", "attempted"),
+			errAttr(err),
+		)
+
+		// server failed to shutdown gracefully
+		// so force close it
+		if closeErr := srv.Close(); closeErr != nil {
+			logger.LogAttrs(ctx, slog.LevelError,
+				"server forced shutdown failed",
+				slog.String("server", srvCtx.Name),
+				errAttr(closeErr),
+			)
+			srvCtx.ErrChan <- errors.Join(errServerClose, closeErr, errServerGracefulShutdown, err)
+			return
+		}
+
+		srvCtx.ErrChan <- errors.Join(errServerGracefulShutdown, err)
+		return
+	}
+
+	if err := <-serveRespChan; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.LogAttrs(ctx, slog.LevelError,
+			"server exited unexpectedly",
+			slog.String("graceful-shutdown", "attempted"),
+			slog.String("server", srvCtx.Name),
+			errAttr(err),
+		)
+		srvCtx.ErrChan <- err
+		return
+	}
+
+	logger.LogAttrs(ctx, slog.LevelInfo,
+		"server stopped",
+		slog.String("server", srvCtx.Name),
+	)
 }
