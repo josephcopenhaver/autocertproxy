@@ -47,17 +47,20 @@ func Run() {
 	}
 
 	for _, arg := range os.Args {
-		if arg == "-h" || arg == "--h" || arg == "-help" || arg == "--help" {
-
+		switch arg {
+		case "-h", "--h", "-help", "--help":
 			logger.LogAttrs(ctx, slog.LevelInfo,
-				"help: all configs are env variables",
-				slog.Any("envconfig", cfg),
+				"help: all configs are env variables: to see them run the program with --config but be warned that this will print sensitive information",
 			)
 
 			return
-		}
-
-		if arg == "--version" {
+		case "-show-config", "--show-config":
+			logger.LogAttrs(ctx, slog.LevelInfo,
+				"env variable based runtime configuration",
+				slog.Any("envconfig", cfg),
+			)
+			return
+		case "-v", "--v", "-version", "--version":
 			// TODO: print a version indicator
 			return
 		}
@@ -73,11 +76,36 @@ func Run() {
 		panic(fmt.Errorf("%s: %w", msg, err))
 	}
 
+	logger.LogAttrs(ctx, slog.LevelWarn,
+		"starting proxy",
+	)
+
+	var loggedErrResp bool
+	defer func() {
+		if r := recover(); r != nil {
+			defer panic(r)
+
+			if !loggedErrResp {
+				// this should never happen, but just in case
+				logger.LogAttrs(ctx, slog.LevelError,
+					"proxy panicked",
+					slog.Any("cause", r),
+				)
+			}
+		}
+	}()
+
 	if err := p.ListenAndServe(ctx, logger); err != nil {
-		panic(err)
+		loggedErrResp = true
+		const msg = "proxy failed"
+		logger.LogAttrs(ctx, slog.LevelError,
+			msg,
+			errAttr(err),
+		)
+		panic(fmt.Errorf("%s: %w", msg, err))
 	}
 
 	logger.LogAttrs(ctx, slog.LevelWarn,
-		"server shutdown successful",
+		"proxy stopped",
 	)
 }
