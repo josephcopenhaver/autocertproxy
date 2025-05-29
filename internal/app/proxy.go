@@ -181,7 +181,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 
 		// set the dest host header value as specified
 		{
-			prevHandler := handler
+			next := handler
 
 			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -210,12 +210,12 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 					r.Host = dstHostHeader
 				}
 
-				prevHandler.ServeHTTP(w, r)
+				next.ServeHTTP(w, r)
 			})
 		}
 
 		if cfg.ResponseBufferEnabled {
-			prevHandler := handler
+			next := handler
 
 			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -224,7 +224,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 				{
 					rec := httptest.NewRecorder()
 
-					prevHandler.ServeHTTP(rec, r)
+					next.ServeHTTP(rec, r)
 
 					resp = rec.Result()
 				}
@@ -248,7 +248,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 		}
 
 		if cfg.Authorization != "" {
-			prevHandler := handler
+			next := handler
 
 			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -262,7 +262,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 					}
 				}
 
-				prevHandler.ServeHTTP(w, r)
+				next.ServeHTTP(w, r)
 			})
 		}
 
