@@ -48,7 +48,6 @@ func newProxy(ctx context.Context, cfg config.Config, logger *slog.Logger) (prox
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelError,
 			"failed to parse destination url",
-			slog.String("url", dstUrlStr),
 			errAttr(err),
 		)
 		return proxy{}, err
@@ -57,7 +56,6 @@ func newProxy(ctx context.Context, cfg config.Config, logger *slog.Logger) (prox
 	if s := dstProxyUrl.Scheme; s != "http" && s != "https" {
 		logger.LogAttrs(ctx, slog.LevelError,
 			"failed to parse destination url: scheme must be either http or https",
-			slog.String("url", dstUrlStr),
 			errAttr(err),
 		)
 		return proxy{}, err
@@ -66,7 +64,6 @@ func newProxy(ctx context.Context, cfg config.Config, logger *slog.Logger) (prox
 	if err := os.MkdirAll(cfg.AutocertCacheDir, 0700); err != nil {
 		logger.LogAttrs(ctx, slog.LevelError,
 			"failed to make autocert cache directory",
-			slog.String("directory", cfg.AutocertCacheDir),
 			errAttr(err),
 		)
 		return proxy{}, err
@@ -81,10 +78,8 @@ func newProxy(ctx context.Context, cfg config.Config, logger *slog.Logger) (prox
 func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 	cfg := p.cfg
 
-	logger.LogAttrs(ctx, slog.LevelInfo,
+	logger.LogAttrs(ctx, slog.LevelWarn,
 		"server starting",
-		slog.Any("config", cfg),
-		slog.String("dst_url", p.dstProxyUrl.String()),
 	)
 
 	am := autocert.Manager{
@@ -181,7 +176,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 
 		// set the dest host header value as specified
 		{
-			prevHandler := handler
+			next := handler
 
 			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -210,12 +205,12 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 					r.Host = dstHostHeader
 				}
 
-				prevHandler.ServeHTTP(w, r)
+				next.ServeHTTP(w, r)
 			})
 		}
 
 		if cfg.ResponseBufferEnabled {
-			prevHandler := handler
+			next := handler
 
 			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -224,7 +219,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 				{
 					rec := httptest.NewRecorder()
 
-					prevHandler.ServeHTTP(rec, r)
+					next.ServeHTTP(rec, r)
 
 					resp = rec.Result()
 				}
@@ -248,7 +243,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 		}
 
 		if cfg.Authorization != "" {
-			prevHandler := handler
+			next := handler
 
 			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -262,7 +257,7 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 					}
 				}
 
-				prevHandler.ServeHTTP(w, r)
+				next.ServeHTTP(w, r)
 			})
 		}
 
@@ -378,7 +373,7 @@ func asyncListenAndServe(ctx context.Context, logger *slog.Logger, errChan chan 
 		// context has been cancelled, so we should try to shutdown the server gracefully
 	}
 
-	logger.LogAttrs(ctx, slog.LevelInfo,
+	logger.LogAttrs(ctx, slog.LevelWarn,
 		"gracefully shutting down server",
 		slog.String("server", name),
 	)
@@ -421,7 +416,7 @@ func asyncListenAndServe(ctx context.Context, logger *slog.Logger, errChan chan 
 		return
 	}
 
-	logger.LogAttrs(ctx, slog.LevelInfo,
+	logger.LogAttrs(ctx, slog.LevelWarn,
 		"server stopped",
 		slog.String("server", name),
 	)
