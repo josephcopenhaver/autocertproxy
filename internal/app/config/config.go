@@ -29,6 +29,6 @@ type Config struct {
 	Authorization         string        `json:"AUTHORIZATION" default:""`
 }
 
-func Load(cfgPtr interface{}) error {
-	return envconfig.Process("", cfgPtr)
+func Load(cfg *Config) error {
+	return envconfig.Process("", cfg)
 }
