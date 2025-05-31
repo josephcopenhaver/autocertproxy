@@ -282,8 +282,12 @@ func (p *proxy) ListenAndServe(ctx context.Context, logger *slog.Logger) error {
 
 	shutdownErrors := make([]error, 0, len(srvContexts))
 	for _, srvContext := range srvContexts {
-		if err, ok := <-srvContext.errChan; ok {
+		c := srvContext.errChan
+		if err, ok := <-c; ok {
 			shutdownErrors = append(shutdownErrors, fmt.Errorf("error server %s: %w", srvContext.name, err))
+
+			// confirms the channel is closed, meaning the goroutine has finished
+			<-c
 		}
 	}
 
@@ -319,6 +323,7 @@ var (
 	errServerGracefulShutdown = errors.New("server graceful shutdown failed")
 	errServerClose            = errors.New("server close failed")
 	errServerNotStarted       = errors.New("server not started")
+	errServerPanic            = errors.New("server panicked")
 )
 
 func listenAndServe(ctx context.Context, logger *slog.Logger, cfg listenAndServeConfig) <-chan error {
@@ -346,6 +351,7 @@ func asyncListenAndServe(ctx context.Context, logger *slog.Logger, errChan chan 
 	if err := ctx.Err(); err != nil {
 		logger.LogAttrs(ctx, slog.LevelError,
 			"server ListenAndServe not attempted",
+			slog.String("server", name),
 			errAttr(err),
 		)
 		errChan <- errors.Join(errServerNotStarted, err)
@@ -353,17 +359,34 @@ func asyncListenAndServe(ctx context.Context, logger *slog.Logger, errChan chan 
 	}
 
 	go func() {
+		defer close(serveRespChan)
+
 		serveRespChan <- listenAndServe()
 	}()
 
 	ctxDone := ctx.Done()
 	select {
-	case err := <-serveRespChan:
-		if err != nil {
+	case err, ok := <-serveRespChan:
+		if !ok {
 			logger.LogAttrs(ctx, slog.LevelError,
 				"server exited unexpectedly",
-				slog.String("graceful-shutdown", "not attempted"),
 				slog.String("server", name),
+				slog.String("graceful-shutdown", "not attempted"),
+				slog.String("reason", "panic"),
+			)
+			errChan <- errServerPanic
+			return
+		}
+
+		// waits for server goroutine to finish
+		<-serveRespChan
+
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.LogAttrs(ctx, slog.LevelError,
+				"server exited unexpectedly",
+				slog.String("server", name),
+				slog.String("graceful-shutdown", "not attempted"),
+				slog.String("reason", "error"),
 				errAttr(err),
 			)
 			errChan <- err
@@ -408,8 +431,8 @@ func asyncListenAndServe(ctx context.Context, logger *slog.Logger, errChan chan 
 	if err := <-serveRespChan; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.LogAttrs(ctx, slog.LevelError,
 			"server exited unexpectedly",
-			slog.String("graceful-shutdown", "attempted"),
 			slog.String("server", name),
+			slog.String("graceful-shutdown", "attempted"),
 			errAttr(err),
 		)
 		errChan <- err
