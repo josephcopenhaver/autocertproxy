@@ -1,13 +1,13 @@
 module github.com/josephcopenhaver/autocertproxy
 
-go 1.24
+go 1.24.0
 
 require (
 	github.com/kelseyhightower/envconfig v1.4.0
-	golang.org/x/crypto v0.38.0
+	golang.org/x/crypto v0.45.0
 )
 
 require (
-	golang.org/x/net v0.40.0 // indirect
-	golang.org/x/text v0.25.0 // indirect
+	golang.org/x/net v0.47.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
 )
